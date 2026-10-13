@@ -1,110 +1,91 @@
 <?php
 
-declare(strict_types=1);
-
 namespace App\Tracking;
 
 use App\Models\Rep;
 use Illuminate\Support\Facades\DB;
 
 /**
- * Write path for device uploads.
+ * Stores points uploaded by a rep's phone.
  *
- * Idempotent by design: the primary key (rep_id, recorded_at) means a batch that is re-sent
- * after a timeout is simply absorbed as duplicates, so the device can retry until it gets a
- * 2xx without ever creating double data. Each valid fix is either stored or reported back as
- * a duplicate; only fixes that can never be valid are rejected, with a reason per index.
+ * Safe to retry: a point that is already stored (same rep, same second) is skipped and
+ * counted as a duplicate. So if the phone did not get our answer and sends the batch again,
+ * nothing is stored twice and nothing is lost.
  */
 final class IngestionService
 {
-    private const INSERT_CHUNK = 500;
-
     /**
-     * @param  list<array<string, mixed>>  $rawPoints
+     * @param  array<int, mixed>  $input  points as sent by the phone
+     * @return array{received: int, stored: int, duplicates: int, rejected: list<array{index: int, reason: string}>}
      */
-    public function ingest(Rep $rep, array $rawPoints): IngestResult
+    public function store(Rep $rep, array $input): array
     {
-        $rejected = [];
         $points = [];
+        $rejected = [];
 
-        foreach ($rawPoints as $index => $raw) {
-            $result = $this->normalize($raw);
-            if (is_string($result)) {
-                $rejected[] = ['index' => $index, 'reason' => $result];
+        foreach ($input as $index => $raw) {
+            $error = $this->validate($raw);
+            if ($error !== null) {
+                // Report the bad point but keep the rest of the batch.
+                $rejected[] = ['index' => $index, 'reason' => $error];
 
                 continue;
             }
-            // Same second sent twice in one batch: keep the first.
-            $points[$result->ts] ??= $result;
+
+            $point = $this->toPoint($raw);
+            $points[$point->ts] ??= $point;   // the same second twice in one batch: keep the first
         }
 
-        $days = array_values(array_unique(array_map(fn (Point $p) => $rep->localDate($p->ts), $points)));
-        sort($days);
+        $days = array_unique(array_map(fn (Point $p) => LocalDay::of($p->ts), $points));
 
         $stored = DB::transaction(function () use ($rep, $points, $days) {
             $stored = 0;
-            foreach (array_chunk($points, self::INSERT_CHUNK) as $chunk) {
-                $stored += DB::table('location_points')->insertOrIgnore(
-                    array_map(fn (Point $p) => $p->toRow($rep->id), $chunk),
-                );
+            foreach (array_chunk($points, 500) as $chunk) {
+                $rows = array_map(fn (Point $p) => $p->toDatabase($rep->id), $chunk);
+                $stored += DB::table('location_points')->insertOrIgnore($rows);
             }
 
-            // Same transaction: raw data is never committed without its archive marker.
-            DB::table('pending_archive_days')->insertOrIgnore(
-                array_map(fn (string $day) => ['rep_id' => $rep->id, 'date' => $day], $days),
-            );
+            // In the same transaction: remember that these days need (re)archiving.
+            $pending = array_map(fn (string $day) => ['rep_id' => $rep->id, 'date' => $day], $days);
+            DB::table('pending_archive_days')->insertOrIgnore(array_values($pending));
 
             return $stored;
         });
 
-        return new IngestResult(
-            received: count($rawPoints),
-            stored: $stored,
-            duplicates: count($rawPoints) - count($rejected) - $stored,
-            rejected: $rejected,
-            days: $days,
-        );
+        return [
+            'received' => count($input),
+            'stored' => $stored,
+            'duplicates' => count($input) - count($rejected) - $stored,
+            'rejected' => $rejected,
+        ];
     }
 
-    /** @return Point|string the point, or the reason it is rejected */
-    private function normalize(mixed $raw): Point|string
+    private function validate(mixed $raw): ?string
     {
         if (! is_array($raw)) {
             return 'Point must be an object.';
         }
 
         $ts = $this->timestamp($raw['recorded_at'] ?? null);
-        if ($ts === null) {
-            return 'recorded_at must be an ISO-8601 date or unix timestamp.';
-        }
-        if ($ts > time() + config('tracking.max_future_skew_seconds')) {
-            return 'recorded_at is in the future.';
-        }
-        if ($ts < 946684800) {
-            return 'recorded_at is before 2000-01-01.';
-        }
 
-        $lat = $raw['lat'] ?? null;
-        $lng = $raw['lng'] ?? null;
-        if (! is_numeric($lat) || $lat < -90 || $lat > 90) {
-            return 'lat must be between -90 and 90.';
-        }
-        if (! is_numeric($lng) || $lng < -180 || $lng > 180) {
-            return 'lng must be between -180 and 180.';
-        }
+        return match (true) {
+            $ts === null => 'recorded_at must be an ISO-8601 date or a unix timestamp.',
+            $ts > time() + 300 => 'recorded_at is in the future.',
+            ! is_numeric($raw['lat'] ?? null) || abs($raw['lat']) > 90 => 'lat must be between -90 and 90.',
+            ! is_numeric($raw['lng'] ?? null) || abs($raw['lng']) > 180 => 'lng must be between -180 and 180.',
+            default => null,
+        };
+    }
 
-        $optional = fn (string $key, float $scale, int $max) => isset($raw[$key]) && is_numeric($raw[$key]) && $raw[$key] >= 0
-            ? (int) min($max, round($raw[$key] * $scale))
-            : null;
+    private function toPoint(array $raw): Point
+    {
+        $accuracy = $raw['accuracy'] ?? null;
 
         return new Point(
-            ts: $ts,
-            latE7: (int) round($lat * 1e7),
-            lngE7: (int) round($lng * 1e7),
-            accuracyM: $optional('accuracy', 1, 65535),
-            speedCms: $optional('speed', 100, 65535),
-            headingDeg: isset($raw['heading']) && is_numeric($raw['heading']) ? ((int) round($raw['heading'])) % 360 : null,
-            batteryPct: $optional('battery', 1, 100),
+            ts: $this->timestamp($raw['recorded_at']),
+            latE7: (int) round($raw['lat'] * 1e7),
+            lngE7: (int) round($raw['lng'] * 1e7),
+            accuracyM: is_numeric($accuracy) && $accuracy >= 0 ? (int) min(65535, round($accuracy)) : null,
         );
     }
 
@@ -113,13 +94,8 @@ final class IngestionService
         if (is_int($value) || (is_string($value) && ctype_digit($value))) {
             return (int) $value;
         }
-        if (is_float($value)) {
-            return (int) floor($value);
-        }
-        if (is_string($value) && $value !== '') {
-            $ts = strtotime($value);
-
-            return $ts === false ? null : $ts;
+        if (is_string($value) && strtotime($value) !== false) {
+            return strtotime($value);
         }
 
         return null;

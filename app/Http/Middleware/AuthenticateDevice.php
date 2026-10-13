@@ -8,15 +8,13 @@ use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
 /**
- * Authenticates a rep's phone by its Bearer device token and binds the rep to the request,
- * so a device can only ever write its own track.
+ * Finds the rep by the Bearer token their phone sends. A phone can only upload its own points.
  */
 class AuthenticateDevice
 {
     public function handle(Request $request, Closure $next): Response
     {
-        $token = $request->bearerToken();
-        $rep = $token ? Rep::findByDeviceToken($token) : null;
+        $rep = $request->bearerToken() ? Rep::findByDeviceToken($request->bearerToken()) : null;
 
         if (! $rep) {
             return response()->json(['message' => 'Invalid or missing device token.'], 401);

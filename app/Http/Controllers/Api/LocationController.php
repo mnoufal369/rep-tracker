@@ -10,15 +10,15 @@ use Illuminate\Http\JsonResponse;
 class LocationController extends Controller
 {
     /**
-     * Receives a batch of buffered fixes from a rep's phone.
+     * A rep's phone uploads a batch of points.
      *
-     * 201 means every fix that is not listed in `rejected` is durably stored (or was already
-     * stored by an earlier attempt), so the device may delete the whole batch from its buffer.
+     * A 201 answer means every point not listed in `rejected` is safely stored, so the phone
+     * may remove the batch from its local buffer.
      */
     public function store(StoreLocationsRequest $request, IngestionService $ingestion): JsonResponse
     {
-        $result = $ingestion->ingest($request->attributes->get('rep'), $request->validated('points'));
+        $rep = $request->attributes->get('rep');
 
-        return response()->json($result->toApi(), 201);
+        return response()->json($ingestion->store($rep, $request->validated('points')), 201);
     }
 }

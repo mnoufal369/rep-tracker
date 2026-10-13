@@ -1,21 +1,18 @@
 <?php
 
-declare(strict_types=1);
-
 namespace App\Tracking;
 
 use App\Models\DailyTrack;
 use App\Models\Rep;
-use App\Tracking\Analysis\TrackAnalyzer;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
 
 /**
- * Compacts one rep-day into a single `daily_tracks` row.
+ * Saves a rep's day into the archive (`daily_tracks`).
  *
- * The archive is built from the union of the existing archive and the raw rows, then decoded
- * again and compared (checksum) with its source before it is written. Only after that does
- * the day leave the pending queue, which is what allows its raw rows to be pruned later.
+ * The archive is built from everything we have for that day (old archive + raw points),
+ * then unpacked again and compared with the original. Only when they match is the day
+ * removed from the pending list, and only then may its raw points be deleted later.
  */
 final class DayArchiver
 {
@@ -23,82 +20,51 @@ final class DayArchiver
         private readonly DayTrackReader $reader,
     ) {}
 
-    public function archive(Rep $rep, string $date): ?DailyTrack
+    public function archive(Rep $rep, string $date): void
     {
-        return DB::transaction(function () use ($rep, $date) {
+        DB::transaction(function () use ($rep, $date) {
             $points = $this->reader->points($rep, $date);
 
-            if (! $points) {
-                DB::table('pending_archive_days')->where(['rep_id' => $rep->id, 'date' => $date])->delete();
+            if ($points) {
+                $blob = TrackCodec::encode($points);
+                $checksum = TrackCodec::checksum($points);
 
-                return null;
-            }
+                if (TrackCodec::checksum(TrackCodec::decode($blob)) !== $checksum) {
+                    throw new RuntimeException("Archive check failed for rep {$rep->id} on {$date}.");
+                }
 
-            $blob = TrackCodec::encode($points);
-            $checksum = TrackCodec::checksum($points);
-            if (TrackCodec::checksum(TrackCodec::decode($blob)) !== $checksum) {
-                throw new RuntimeException("Archive verification failed for rep {$rep->id} on {$date}.");
-            }
+                $summary = DaySummary::of($points);
 
-            $analysis = TrackAnalyzer::fromConfig()->analyze($points);
-
-            $track = DailyTrack::updateOrCreate(
-                ['rep_id' => $rep->id, 'date' => $date],
-                [
-                    'point_count' => $analysis->pointCount,
-                    'first_recorded_at' => gmdate('Y-m-d H:i:s', $analysis->firstTs),
-                    'last_recorded_at' => gmdate('Y-m-d H:i:s', $analysis->lastTs),
-                    'distance_m' => $analysis->distanceM,
-                    'moving_seconds' => $analysis->movingSeconds,
-                    'stop_count' => $analysis->stopCount,
-                    'gap_count' => $analysis->gapCount,
-                    'longest_gap_seconds' => $analysis->longestGapSeconds,
-                    ...$analysis->bounds,
-                    'codec_version' => TrackCodec::VERSION,
+                DailyTrack::updateOrCreate(['rep_id' => $rep->id, 'date' => $date], [
+                    'point_count' => $summary['point_count'],
+                    'first_recorded_at' => gmdate('Y-m-d H:i:s', $points[0]->ts),
+                    'last_recorded_at' => gmdate('Y-m-d H:i:s', end($points)->ts),
+                    'distance_m' => $summary['distance_m'],
+                    'gap_count' => $summary['gap_count'],
                     'checksum' => $checksum,
                     'points_blob' => $blob,
-                ],
-            );
+                ]);
+            }
 
             DB::table('pending_archive_days')->where(['rep_id' => $rep->id, 'date' => $date])->delete();
-
-            return $track;
         });
     }
 
     /**
-     * Archives every queued day that is past the grace period.
+     * Archives every pending day before $beforeDate (default: today, so finished days only).
      *
      * @return int number of days archived
      */
-    public function archivePending(?callable $onDay = null): int
+    public function archivePending(?string $beforeDate = null): int
     {
-        $cutoff = now()->subHours(config('tracking.archive_grace_hours'));
-        $reps = Rep::all()->keyBy('id');
-        $count = 0;
-
-        // The queue only holds days that received data and are not archived yet: it stays small.
-        $pending = DB::table('pending_archive_days')->orderBy('date')->get();
+        $pending = DB::table('pending_archive_days')
+            ->where('date', '<', $beforeDate ?? LocalDay::today())
+            ->get();
 
         foreach ($pending as $row) {
-            $date = substr((string) $row->date, 0, 10);
-            $rep = $reps->get($row->rep_id);
-
-            if (! $rep) {
-                DB::table('pending_archive_days')->where('rep_id', $row->rep_id)->delete();
-
-                continue;
-            }
-            // Wait until the local day (plus grace) is over, so late uploads land first.
-            if ($rep->dayBounds($date)[1]->greaterThan($cutoff)) {
-                continue;
-            }
-
-            $this->archive($rep, $date);
-            $count++;
-            $onDay && $onDay($rep, $date);
+            $this->archive(Rep::findOrFail($row->rep_id), substr($row->date, 0, 10));
         }
 
-        return $count;
+        return $pending->count();
     }
 }

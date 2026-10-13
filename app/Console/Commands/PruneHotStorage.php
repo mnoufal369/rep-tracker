@@ -2,24 +2,17 @@
 
 namespace App\Console\Commands;
 
-use App\Tracking\Storage\HotStoragePruner;
+use App\Tracking\HotStoragePruner;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
 use Illuminate\Console\Command;
 
-#[Signature('tracking:prune {--dry-run : Only show what would be removed}')]
-#[Description('Drop raw fixes older than the hot retention window, after verifying they are archived')]
+#[Signature('tracking:prune')]
+#[Description('Delete raw points older than the retention period (after archiving them)')]
 class PruneHotStorage extends Command
 {
-    public function handle(HotStoragePruner $pruner): int
+    public function handle(HotStoragePruner $pruner): void
     {
-        $actions = $pruner->prune((bool) $this->option('dry-run'));
-
-        foreach ($actions as $action) {
-            $this->line(($this->option('dry-run') ? '[dry-run] ' : '').$action);
-        }
-        $this->info($actions ? 'Done.' : 'Nothing older than '.config('tracking.hot_retention_days').' days.');
-
-        return self::SUCCESS;
+        $this->info('Done. Dropped '.$pruner->prune().' old monthly partition(s).');
     }
 }

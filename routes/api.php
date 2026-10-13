@@ -6,17 +6,15 @@ use App\Http\Middleware\AuthenticateDevice;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('v1')->group(function () {
-    // Device (rep's phone) write path.
-    Route::post('locations', [LocationController::class, 'store'])
-        ->middleware([AuthenticateDevice::class, 'throttle:device']);
+    // Upload from a rep's phone (authenticated with the device token).
+    Route::post('locations', [LocationController::class, 'store'])->middleware(AuthenticateDevice::class);
 
-    // Management read path.
+    // Inspect the daily logs.
     Route::get('reps', [RepDayController::class, 'reps']);
-    Route::prefix('reps/{rep}/days')->group(function () {
-        Route::get('/', [RepDayController::class, 'index']);
-        Route::get('{date}', [RepDayController::class, 'show']);
-        Route::get('{date}/track', [RepDayController::class, 'track']);
-        Route::get('{date}/points', [RepDayController::class, 'points']);
-        Route::post('{date}/simulate', [RepDayController::class, 'simulate']);
-    });
+    Route::get('reps/{rep}/days', [RepDayController::class, 'index']);
+    Route::get('reps/{rep}/days/{date}', [RepDayController::class, 'show']);
+    Route::get('reps/{rep}/days/{date}/points', [RepDayController::class, 'points']);
+
+    // Generate test data.
+    Route::post('reps/{rep}/days/{date}/generate', [RepDayController::class, 'generate']);
 });

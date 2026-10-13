@@ -5,11 +5,11 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
 /**
- * Cold storage: one row per rep per local day.
+ * The archive: one row per rep per day, kept for years.
  *
- * `points_blob` is a lossless, delta + varint encoded, deflated copy of every raw fix of
- * the day (see TrackCodec). The remaining columns are pre-computed so listing years of
- * history never has to decode a blob.
+ * `points_blob` holds every point of the day, compressed without losing anything
+ * (see TrackCodec). The other columns are a ready-made summary, so listing old days
+ * never needs to unpack the blob.
  */
 return new class extends Migration
 {
@@ -18,22 +18,14 @@ return new class extends Migration
         Schema::create('daily_tracks', function (Blueprint $table) {
             $table->id();
             $table->foreignId('rep_id')->constrained('reps')->cascadeOnDelete();
-            $table->date('date');                       // local date in the rep's timezone
+            $table->date('date');
             $table->unsignedInteger('point_count');
             $table->dateTime('first_recorded_at');
             $table->dateTime('last_recorded_at');
             $table->unsignedInteger('distance_m');
-            $table->unsignedInteger('moving_seconds');
-            $table->unsignedSmallInteger('stop_count');
             $table->unsignedSmallInteger('gap_count');
-            $table->unsignedInteger('longest_gap_seconds');
-            $table->integer('min_lat_e7');
-            $table->integer('min_lng_e7');
-            $table->integer('max_lat_e7');
-            $table->integer('max_lng_e7');
-            $table->unsignedTinyInteger('codec_version');
-            $table->char('checksum', 64);               // sha256 of the canonical raw points
-            $table->rawColumn('points_blob', 'mediumblob');   // up to 16 MB
+            $table->char('checksum', 64);
+            $table->rawColumn('points_blob', 'mediumblob');
             $table->timestamps();
 
             $table->unique(['rep_id', 'date']);

@@ -1,166 +1,137 @@
 <?php
 
-declare(strict_types=1);
-
 namespace App\Tracking;
 
-use InvalidArgumentException;
+use RuntimeException;
 
 /**
- * Lossless compact binary encoding of a day of GPS fixes.
+ * Packs a day of points into a small binary string, and back, without losing anything.
  *
- * Layout (version 1), before deflate:
- *   varint count
- *   then one column per field, each `count` values long:
- *     ts       delta from previous fix (first is absolute), unsigned varint
- *     lat/lng  zig-zag varint delta in 1e-7 degrees
- *     accuracy, speed, heading, battery
- *              0 = null, otherwise zig-zag delta from the previous non-null value, +1
+ * Why it is small: a walking rep's next point is only a few seconds and a few metres away
+ * from the previous one. So instead of full values we store the *difference* from the
+ * previous point, which is a small number and fits in 1-2 bytes (a "varint"). The result
+ * is then compressed with gzip (deflate).
  *
- * Consecutive fixes of a walking person differ by a few seconds and a few metres, so most
- * deltas fit in 1-2 bytes, and storing the data column-wise lets deflate find the long runs
- * (e.g. a constant 5 s interval, an unchanging battery level). Every bit of the source data
- * survives a round trip; nothing is rounded or simplified.
+ * Layout before compression:
+ *   number of points
+ *   all timestamp differences
+ *   all latitude differences
+ *   all longitude differences
+ *   all accuracies (0 = unknown, otherwise accuracy + 1)
+ *
+ * Storing each field together (instead of point by point) puts similar numbers next to each
+ * other, which gzip compresses much better.
  */
 final class TrackCodec
 {
-    public const VERSION = 1;
-
-    /** @param list<Point> $points sorted by timestamp, unique */
+    /** @param list<Point> $points sorted by time */
     public static function encode(array $points): string
     {
-        $columns = array_fill(0, 7, '');
-        $prev = [0, 0, 0];
-        $prevOptional = [0, 0, 0, 0];
+        $times = $lats = $lngs = $accuracies = '';
+        $previous = new Point(0, 0, 0);
 
-        foreach ($points as $p) {
-            $columns[0] .= self::varint($p->ts - $prev[0]);
-            $columns[1] .= self::varint(self::zigzag($p->latE7 - $prev[1]));
-            $columns[2] .= self::varint(self::zigzag($p->lngE7 - $prev[2]));
-            $prev = [$p->ts, $p->latE7, $p->lngE7];
-
-            foreach ([$p->accuracyM, $p->speedCms, $p->headingDeg, $p->batteryPct] as $i => $value) {
-                if ($value === null) {
-                    $columns[3 + $i] .= "\x00";
-
-                    continue;
-                }
-                $columns[3 + $i] .= self::varint(self::zigzag($value - $prevOptional[$i]) + 1);
-                $prevOptional[$i] = $value;
-            }
+        foreach ($points as $point) {
+            $times .= self::writeNumber($point->ts - $previous->ts);
+            $lats .= self::writeNumber(self::toUnsigned($point->latE7 - $previous->latE7));
+            $lngs .= self::writeNumber(self::toUnsigned($point->lngE7 - $previous->lngE7));
+            $accuracies .= self::writeNumber($point->accuracyM === null ? 0 : $point->accuracyM + 1);
+            $previous = $point;
         }
 
-        $raw = self::varint(count($points)).implode('', $columns);
-
-        return gzdeflate($raw, 9);
+        return gzdeflate(self::writeNumber(count($points)).$times.$lats.$lngs.$accuracies, 9);
     }
 
     /** @return list<Point> */
-    public static function decode(string $blob, int $version = self::VERSION): array
+    public static function decode(string $blob): array
     {
-        if ($version !== self::VERSION) {
-            throw new InvalidArgumentException("Unsupported track codec version {$version}.");
-        }
-
-        $raw = gzinflate($blob);
-        if ($raw === false) {
-            throw new InvalidArgumentException('Corrupt track blob.');
+        $data = gzinflate($blob);
+        if ($data === false) {
+            throw new RuntimeException('The archived track is corrupt.');
         }
 
         $offset = 0;
-        $count = self::readVarint($raw, $offset);
-        $columns = array_fill(0, 7, []);
+        $count = self::readNumber($data, $offset);
 
-        $acc = 0;
-        for ($i = 0; $i < $count; $i++) {
-            $acc += self::readVarint($raw, $offset);
-            $columns[0][] = $acc;
-        }
-        foreach ([1, 2] as $c) {
-            $acc = 0;
-            for ($i = 0; $i < $count; $i++) {
-                $acc += self::unzigzag(self::readVarint($raw, $offset));
-                $columns[$c][] = $acc;
-            }
-        }
-        foreach ([3, 4, 5, 6] as $c) {
-            $acc = 0;
-            for ($i = 0; $i < $count; $i++) {
-                $v = self::readVarint($raw, $offset);
-                if ($v === 0) {
-                    $columns[$c][] = null;
-
-                    continue;
-                }
-                $acc += self::unzigzag($v - 1);
-                $columns[$c][] = $acc;
-            }
-        }
+        $times = self::readDeltas($data, $offset, $count, signed: false);
+        $lats = self::readDeltas($data, $offset, $count, signed: true);
+        $lngs = self::readDeltas($data, $offset, $count, signed: true);
 
         $points = [];
         for ($i = 0; $i < $count; $i++) {
-            $points[] = new Point(
-                $columns[0][$i], $columns[1][$i], $columns[2][$i],
-                $columns[3][$i], $columns[4][$i], $columns[5][$i], $columns[6][$i],
-            );
+            $accuracy = self::readNumber($data, $offset);
+            $points[] = new Point($times[$i], $lats[$i], $lngs[$i], $accuracy === 0 ? null : $accuracy - 1);
         }
 
         return $points;
     }
 
     /**
-     * Stable fingerprint of a point list, used to prove an archive matches its source.
+     * A fingerprint of the points. Used to prove that the archive decodes to exactly the
+     * data it was built from.
      *
      * @param  list<Point>  $points
      */
     public static function checksum(array $points): string
     {
-        $ctx = hash_init('sha256');
+        $text = '';
         foreach ($points as $p) {
-            hash_update($ctx, "{$p->ts},{$p->latE7},{$p->lngE7},{$p->accuracyM},{$p->speedCms},{$p->headingDeg},{$p->batteryPct}\n");
+            $text .= "{$p->ts},{$p->latE7},{$p->lngE7},{$p->accuracyM}\n";
         }
 
-        return hash_final($ctx);
+        return hash('sha256', $text);
     }
 
-    private static function zigzag(int $n): int
+    /** Reads $count differences and adds them up again into the original values. */
+    private static function readDeltas(string $data, int &$offset, int $count, bool $signed): array
     {
-        return ($n << 1) ^ ($n >> 63);
-    }
-
-    private static function unzigzag(int $z): int
-    {
-        return ($z >> 1) ^ -($z & 1);
-    }
-
-    private static function varint(int $n): string
-    {
-        if ($n < 0) {
-            throw new InvalidArgumentException('varint must be unsigned; points must be sorted by time.');
+        $values = [];
+        $value = 0;
+        for ($i = 0; $i < $count; $i++) {
+            $number = self::readNumber($data, $offset);
+            $value += $signed ? self::toSigned($number) : $number;
+            $values[] = $value;
         }
 
-        $out = '';
-        while ($n >= 0x80) {
-            $out .= chr(($n & 0x7F) | 0x80);
-            $n >>= 7;
-        }
-
-        return $out.chr($n);
+        return $values;
     }
 
-    private static function readVarint(string $buf, int &$offset): int
+    // Differences can be negative; "zigzag" maps 0, -1, 1, -2, 2 ... to 0, 1, 2, 3, 4 ...
+    private static function toUnsigned(int $n): int
     {
-        $result = 0;
-        $shift = 0;
+        return $n >= 0 ? $n * 2 : -$n * 2 - 1;
+    }
+
+    private static function toSigned(int $n): int
+    {
+        return $n % 2 === 0 ? intdiv($n, 2) : -intdiv($n + 1, 2);
+    }
+
+    // Varint: 7 bits per byte, the high bit says "another byte follows".
+    // Numbers below 128 take 1 byte, below 16,384 take 2 bytes, and so on.
+    private static function writeNumber(int $n): string
+    {
+        $bytes = '';
+        while ($n >= 128) {
+            $bytes .= chr(($n % 128) + 128);
+            $n = intdiv($n, 128);
+        }
+
+        return $bytes.chr($n);
+    }
+
+    private static function readNumber(string $data, int &$offset): int
+    {
+        $n = 0;
+        $multiplier = 1;
         do {
-            if (! isset($buf[$offset])) {
-                throw new InvalidArgumentException('Truncated track blob.');
+            if ($offset >= strlen($data)) {
+                throw new RuntimeException('The archived track is truncated.');
             }
-            $byte = ord($buf[$offset++]);
-            $result |= ($byte & 0x7F) << $shift;
-            $shift += 7;
-        } while ($byte & 0x80);
+            $byte = ord($data[$offset++]);
+            $n += ($byte % 128) * $multiplier;
+            $multiplier *= 128;
+        } while ($byte >= 128);
 
-        return $result;
+        return $n;
     }
 }

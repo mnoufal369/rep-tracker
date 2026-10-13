@@ -5,11 +5,10 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
 /**
- * Work queue of rep-days that received data and still need to be (re)archived.
+ * Days that received new points and still need to be (re)archived.
  *
- * Written in the same transaction as the raw points, so a day can never have raw data
- * without either a marker here or an up-to-date archive. This is what makes it safe to
- * drop raw partitions later, and it covers devices that upload days late.
+ * A row is added in the same transaction as the points, so raw data can never exist
+ * without either an up-to-date archive or a row here.
  */
 return new class extends Migration
 {
@@ -18,10 +17,8 @@ return new class extends Migration
         Schema::create('pending_archive_days', function (Blueprint $table) {
             $table->unsignedInteger('rep_id');
             $table->date('date');
-            $table->timestamp('created_at')->useCurrent();
 
             $table->primary(['rep_id', 'date']);
-            $table->index('date');
         });
     }
 

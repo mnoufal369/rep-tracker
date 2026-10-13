@@ -12,8 +12,7 @@ return new class extends Migration
             $table->id();
             $table->string('name');
             $table->string('email')->unique();
-            $table->string('timezone', 64)->default('Europe/Amsterdam');
-            // sha256 of the token the rep's device sends as a Bearer token.
+            // sha256 of the token the rep's phone sends. The token itself is never stored.
             $table->char('device_token_hash', 64)->unique();
             $table->timestamps();
         });

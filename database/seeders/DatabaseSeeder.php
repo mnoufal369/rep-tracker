@@ -8,39 +8,21 @@ use Illuminate\Support\Facades\Artisan;
 
 class DatabaseSeeder extends Seeder
 {
-    /**
-     * Four reps with three weeks of simulated shifts (plus today so far, if the shift has
-     * started) and an old week that only exists in the archive.
-     */
     public function run(): void
     {
-        $reps = [
-            ['Sanne de Vries', 'sanne@example.com'],
-            ['Daan Bakker', 'daan@example.com'],
-            ['Fatima El Amrani', 'fatima@example.com'],
-            ['Lucas Janssen', 'lucas@example.com'],
-        ];
-
-        foreach ($reps as [$name, $email]) {
-            Rep::factory()->create(['name' => $name, 'email' => $email]);
+        foreach (['Sanne de Vries', 'Daan Bakker', 'Fatima El Amrani', 'Lucas Janssen'] as $i => $name) {
+            Rep::factory()->create(['name' => $name, 'email' => 'rep'.($i + 1).'@example.com']);
         }
 
-        $output = $this->command->getOutput();
-
-        // A week from three years ago: archived, then its raw partitions are dropped, so it is
-        // served from cold storage only, exactly like real history would be.
+        // One week, three years ago: will be archived and its raw points deleted,
+        // so it is read back from the archive only.
         $oldWeek = now()->subYears(3)->startOfWeek();
-        Artisan::call('tracking:simulate', ['--rep' => [1, 2], '--from' => $oldWeek->toDateString(), '--to' => $oldWeek->addDays(4)->toDateString()], $output);
+        Artisan::call('tracking:generate', ['from' => $oldWeek->toDateString(), 'to' => $oldWeek->addDays(4)->toDateString(), '--rep' => [1]]);
 
-        // The last three weeks, archived but still in hot storage.
-        Artisan::call('tracking:simulate', ['--from' => now()->subDays(21)->toDateString(), '--to' => now()->subDay()->toDateString()], $output);
+        // The last three weeks, including today so far.
+        Artisan::call('tracking:generate', ['from' => now()->subWeeks(3)->toDateString(), 'to' => now()->toDateString()]);
 
-        Artisan::call('tracking:archive', [], $output);
-        Artisan::call('tracking:prune', [], $output);
-
-        // Today stays "live" (raw only), like a shift in progress.
-        if (now(config('tracking.default_timezone'))->hour >= 10) {
-            Artisan::call('tracking:simulate', [], $output);
-        }
+        Artisan::call('tracking:archive');
+        Artisan::call('tracking:prune');
     }
 }

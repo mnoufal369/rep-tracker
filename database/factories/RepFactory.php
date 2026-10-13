@@ -14,7 +14,6 @@ class RepFactory extends Factory
         return [
             'name' => fake()->name(),
             'email' => fake()->unique()->safeEmail(),
-            'timezone' => 'Europe/Amsterdam',
             'device_token_hash' => hash('sha256', Str::random(48)),
         ];
     }

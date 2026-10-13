@@ -8,20 +8,16 @@ use PHPUnit\Framework\TestCase;
 
 class TrackCodecTest extends TestCase
 {
-    public function test_round_trip_is_lossless(): void
+    public function test_decoding_gives_back_exactly_the_same_points(): void
     {
         $points = [
-            new Point(1760000000, 523745123, 48810456, 8, 140, 28, 97),
-            new Point(1760000005, 523745500, 48810999, null, 0, null, 97),
-            new Point(1760000065, -339000000, -1512000000, 65535, 65535, 359, 0),   // big jumps & extremes
-            new Point(1760003000, 900000000, 1800000000, 1, null, 0, null),
-            new Point(1760003001, -900000000, -1800000000, null, null, null, null),
+            new Point(1760000000, 523745123, 48810456, 8),
+            new Point(1760000005, 523745500, 48810999, null),
+            new Point(1760000065, -339000000, -1512000000, 65535),   // big jump, negative values
+            new Point(1760003000, 900000000, 1800000000, 0),
         ];
 
-        $decoded = TrackCodec::decode(TrackCodec::encode($points));
-
-        $this->assertEquals($points, $decoded);
-        $this->assertSame(TrackCodec::checksum($points), TrackCodec::checksum($decoded));
+        $this->assertEquals($points, TrackCodec::decode(TrackCodec::encode($points)));
     }
 
     public function test_empty_day(): void
@@ -29,23 +25,21 @@ class TrackCodecTest extends TestCase
         $this->assertSame([], TrackCodec::decode(TrackCodec::encode([])));
     }
 
-    public function test_walking_track_compresses_to_a_few_bytes_per_fix(): void
+    public function test_a_walking_day_takes_only_a_few_bytes_per_point(): void
     {
         $points = [];
         for ($i = 0; $i < 3000; $i++) {
-            $points[] = new Point(1760000000 + $i * 5, 523745000 + $i * 50 + ($i * 7919 % 40), 48810000 + $i * 30, 5 + $i % 8, 130 + $i % 20, 90, 100 - intdiv($i, 60));
+            $points[] = new Point(1760000000 + $i * 5, 523745000 + $i * 60 + $i % 37, 48810000 + $i * 40, 8);
         }
 
-        $bytes = strlen(TrackCodec::encode($points));
-
-        $this->assertLessThan(8 * 3000, $bytes);
+        $this->assertLessThan(5 * 3000, strlen(TrackCodec::encode($points)));
     }
 
-    public function test_checksum_detects_any_change(): void
+    public function test_checksum_changes_when_any_value_changes(): void
     {
-        $a = [new Point(1760000000, 1, 2, 3, 4, 5, 6)];
-        $b = [new Point(1760000000, 1, 2, 3, 4, 5, 7)];
-
-        $this->assertNotSame(TrackCodec::checksum($a), TrackCodec::checksum($b));
+        $this->assertNotSame(
+            TrackCodec::checksum([new Point(1760000000, 1, 2, 3)]),
+            TrackCodec::checksum([new Point(1760000000, 1, 2, 4)]),
+        );
     }
 }
