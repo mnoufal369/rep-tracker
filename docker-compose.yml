@@ -1,0 +1,45 @@
+services:
+  app:
+    build: ./docker
+    command: sh docker/start.sh
+    working_dir: /var/www/html
+    volumes:
+      - ./:/var/www/html
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # Runs the nightly archive / partition maintenance jobs (see routes/console.php).
+  scheduler:
+    build: ./docker
+    # Waits for the app container to finish `composer install` and migrations.
+    command: sh -c "until [ -f vendor/autoload.php ] && php artisan migrate:status >/dev/null 2>&1; do sleep 3; done; exec php artisan schedule:work"
+    working_dir: /var/www/html
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: rep_tracking
+      MYSQL_USER: tracking
+      MYSQL_PASSWORD: secret
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "${DB_FORWARD_PORT:-33061}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./docker/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  mysql-data:
